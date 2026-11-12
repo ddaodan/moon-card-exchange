@@ -1,0 +1,19 @@
+{
+  "name": "@moon/api",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node src/local-server.mjs",
+    "test": "vitest run",
+    "build:fc": "node scripts/build-fc.mjs",
+    "create-tables": "node scripts/create-tables.mjs"
+  },
+  "dependencies": {
+    "tablestore": "^5.6.6",
+    "@moon/shared": "*",
+    "hono": "^4.9.0"
+  },
+  "devDependencies": {
+    "vitest": "^3.2.4"
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "name": "moon-card-exchange",
+  "private": true,
+  "type": "module",
+  "description": "原神月谕圣牌交换信息共享站：登记牌匣与想要的牌，同服务器自动匹配互补玩家（B 站 Toy 页面）",
+  "license": "MIT",
+  "workspaces": [
+    "shared",
+    "web",
+    "api"
+  ],
+  "scripts": {
+    "dev:web": "npm run dev --workspace web",
+    "dev:web:mock": "npm run dev:mock --workspace web",
+    "dev:api": "npm run dev --workspace api",
+    "test": "npm run test --workspace shared && npm run test --workspace api",
+    "test:shared": "npm run test --workspace shared",
+    "test:api": "npm run test --workspace api",
+    "test:e2e": "npm run test:e2e --workspace web",
+    "build": "npm run build --workspace web",
+    "check:toy": "node scripts/check-toy.mjs",
+    "fonts": "node scripts/subset-fonts.mjs",
+    "deploy": "node api/scripts/deploy-aliyun.mjs"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "@alicloud/fc2": "^2.6.6",
+    "@alicloud/fc20230330": "^4.8.4",
+    "@alicloud/openapi-core": "^1.0.9",
+    "@alicloud/ots20160620": "^1.0.1",
+    "@alicloud/sts20150401": "^1.2.0",
+    "archiver": "^7.0.1",
+    "subset-font": "^2.3.0"
+  }
+}
