@@ -26,11 +26,14 @@
     "node": ">=24"
   },
   "devDependencies": {
+    "@alicloud/ecs20140526": "^7.11.10",
     "@alicloud/fc2": "^2.6.6",
     "@alicloud/fc20230330": "^4.8.4",
     "@alicloud/openapi-core": "^1.0.9",
     "@alicloud/ots20160620": "^1.0.1",
+    "@alicloud/ram20150501": "^1.4.0",
     "@alicloud/sts20150401": "^1.2.0",
+    "@alicloud/vpc20160428": "^7.3.2",
     "archiver": "^7.0.1",
     "subset-font": "^2.3.0"
   }

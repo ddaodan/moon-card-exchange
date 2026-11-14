@@ -8,9 +8,15 @@
 前置条件：
 
 1. 已有阿里云账号，且开通了函数计算 FC 和 Tablestore（控制台点一次即可）。
-2. 创建一个 RAM 子账号，仅授予 `AliyunOTSFullAccess` 和 `AliyunFCFullAccess`
-   两个权限，为它生成 AccessKey。
-3. 本机能访问阿里云 API（国内网络即可）。
+2. 创建一个 RAM 子账号，授予 `AliyunOTSFullAccess`、`AliyunFCFullAccess` 和
+   `AliyunVPCFullAccess` 三个权限，为它生成 AccessKey。
+3. **首次部署需要控制台点一次授权**：脚本会为 FC 服务绑定 VPC（用于内网
+   访问 Tablestore），这要求 FC 服务持有服务角色 `AliyunFCDefaultRole`。
+   部署脚本没有 RAM 权限创建角色时会停下来并给出提示，此时打开
+   [函数计算控制台](https://fcnext.console.aliyun.com) → 任意函数 → 配置 →
+   权限配置 → 编辑 → 「创建并授权新的服务角色」→ 选 `AliyunFCDefaultRole` →
+   确认授权。授权一次后永久生效，之后再跑 `npm run deploy` 即可。
+4. 本机能访问阿里云 API（国内网络即可）。
 
 然后执行两条命令：
 
@@ -20,10 +26,11 @@ $env:ALIBABA_CLOUD_ACCESS_KEY_SECRET = "你的 AccessKeySecret"
 npm run deploy
 ```
 
-脚本会自动完成：开通 Tablestore 服务、创建实例和数据表、打包 FC 代码、
+脚本会自动完成：开通 Tablestore 服务、创建实例和数据表、创建专用 VPC/
+交换机/安全组、把 Tablestore 实例绑定到 VPC、FC 服务绑定 VPC、打包 FC 代码、
 上传并创建 HTTP 函数与定时函数、创建 HTTP 触发器（匿名访问）和定时触发器
 （北京时间每天 4 点清理）、最后跑健康检查（含一次读 Tablestore 的统计接口，
-提前暴露连通性问题）。全程不需要打开控制台。
+提前暴露连通性问题）。除首次的角色授权外全程不需要打开控制台。
 
 输出末尾会给出 API 地址（FC 2.0 格式，形如
 `https://<账号ID>.<region>.fc.aliyuncs.com/2016-08-15/proxy/<服务名>/<函数名>/`），
@@ -38,11 +45,15 @@ npm run deploy
 | `OTS_INSTANCE` | `moon-card` | Tablestore 实例名 |
 | `RATE_SALT` | 自动生成 | 不传则每次随机生成；重复部署请传同一个值，否则限频 key 会变 |
 | `TOY_ORIGIN` | 无 | Toy 页面的实际 Origin，会追加到 `ALLOWED_ORIGINS` |
+| `FC_ZONE_ID` | 自动选择 | 交换机所在可用区（VPC 创建失败时可手动指定） |
 
 注意事项：
 
-- Tablestore 实例的网络访问默认可能不允许公网调用。如果统计接口报网络错误，
-  到 Tablestore 控制台把实例的网络类型改为「允许公网访问」（或按需配置 VPC）。
+- 函数通过 VPC 内网访问 Tablestore（endpoint 由绑定接口返回，形如
+  `https://<实例名>.<region>.vpc.tablestore.aliyuncs.com`），内网流量不计费。
+  公网 endpoint 仅本机运行 `npm run create-tables` 时使用。
+- 如果统计接口报网络错误，优先检查 FC 服务的 VPC 绑定和服务角色是否配置成功
+  （函数计算控制台 → 服务 → 权限配置），以及 Tablestore 实例是否已绑定 VPC。
 - 自动生成的 `RATE_SALT` 只在输出里出现一次，请复制保存。
 - 再次部署时，函数和触发器会更新代码与配置，不会重复创建。
 
@@ -185,6 +196,7 @@ npm run dev:web
 
 ## 8. 成本控制
 
-1. FC 和 Tablestore 都有免费额度，本项目流量很小，正常使用应为 0 元。
+1. FC 和 Tablestore 都有免费额度；函数内存设为 256MB（CU 减半），并通过 VPC
+   内网访问 Tablestore（内网流量不计费）。本项目流量很小，正常使用账单为 0 元。
 2. 在费用中心设置预算告警（例如 ¥5/月），防止意外。
 3. Tablestore 建表脚本把预留读写 CU 设为 0，按实际用量计费，正常流量在免费额度内。

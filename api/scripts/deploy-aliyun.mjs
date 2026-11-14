@@ -30,7 +30,8 @@ if (!akId || !akSecret) {
   console.error("请先设置阿里云 AccessKey 环境变量：");
   console.error('  $env:ALIBABA_CLOUD_ACCESS_KEY_ID = "..."');
   console.error('  $env:ALIBABA_CLOUD_ACCESS_KEY_SECRET = "..."');
-  console.error("建议使用 RAM 子账号，授予 AliyunOTSFullAccess 和 AliyunFCFullAccess。");
+  console.error("建议使用 RAM 子账号，授予 AliyunOTSFullAccess、AliyunFCFullAccess 与 AliyunVPCFullAccess。");
+  console.error("首次部署需要在控制台授权 FC 服务角色（部署脚本会给出具体路径）。");
   process.exit(1);
 }
 
@@ -43,6 +44,8 @@ const toyOrigin = process.env.TOY_ORIGIN || "";
 const FC2 = require("@alicloud/fc2");
 const STSPkg = require("@alicloud/sts20150401");
 const OTSPkg = require("@alicloud/ots20160620");
+const VPCPkg = require("@alicloud/vpc20160428");
+const ECSPkg = require("@alicloud/ecs20140526");
 
 let fcClient = null;
 let accountId = null;
@@ -118,17 +121,38 @@ async function initFc() {
 }
 
 async function ensureFcService() {
+  const body = {
+    description: "月谕圣牌交换站",
+    role: `acs:ram::${accountId}:role/AliyunFCDefaultRole`,
+    vpcConfig: {
+      vpcId: vpcId,
+      vSwitchIds: [vSwitchId],
+      securityGroupId: securityGroupId
+    }
+  };
   try {
     await fcClient.getService(serviceName);
-    console.log("（服务已存在，跳过创建）");
+    await fcClient.updateService(serviceName, body);
+    console.log("（服务已存在，已更新 VPC 配置）");
     return;
   } catch (error) {
-    if (!isNotFound(error)) {
-      throw error;
+    if (isNotFound(error)) {
+      await fcClient.createService(serviceName, body);
+      console.log(`（已创建服务 ${serviceName}，已绑定 VPC）`);
+      return;
     }
+    const msg = String(error?.message ?? "");
+    if (msg.includes("AliyunFCDefaultRole") || msg.includes("role")) {
+      throw new Error(
+        "FC 服务需要服务角色 AliyunFCDefaultRole 来创建访问 VPC 的网卡。\n" +
+          "请先在控制台完成一次授权（下方路径），再重新运行部署：\n" +
+          "  1. 打开 https://fcnext.console.aliyun.com → 任一函数 → 配置页\n" +
+          "  2. 权限配置 → 编辑 → 创建并授权新的服务角色 → AliyunFCDefaultRole\n" +
+          "  3. 确认授权后，重新运行 npm run deploy"
+      );
+    }
+    throw error;
   }
-  await fcClient.createService(serviceName, { description: "月谕圣牌交换站" });
-  console.log(`（已创建服务 ${serviceName}）`);
 }
 
 // ─── Tablestore 服务与实例 ────────────────────────────────────────────────────
@@ -154,38 +178,202 @@ async function ensureOtsService() {
 }
 
 async function ensureOtsInstance() {
+  let exists = false;
   try {
     const found = await otsClient.getInstance(
       new OTSPkg.GetInstanceRequest({ instanceName: otsInstanceName })
     );
-    if (found?.body?.instanceInfo?.instanceName === otsInstanceName) {
+    exists = found?.body?.instanceInfo?.instanceName === otsInstanceName;
+    if (exists) {
       console.log("（实例已存在，跳过创建）");
-      return;
     }
   } catch {
     // 404 或查询失败都继续尝试创建。
   }
-  await otsClient.insertInstance(
-    new OTSPkg.InsertInstanceRequest({
-      clusterType: "HYBRID",
-      instanceName: otsInstanceName,
-      description: "月谕圣牌交换站数据存储"
-    })
-  );
-  console.log(`（已创建实例 ${otsInstanceName}）`);
-  // 实例创建是异步的，轮询直到可访问。
-  for (let i = 0; i < 12; i++) {
-    await sleep(5000);
-    try {
-      await otsClient.getInstance(
-        new OTSPkg.GetInstanceRequest({ instanceName: otsInstanceName })
-      );
-      return;
-    } catch {
-      // 继续等。
+  if (!exists) {
+    await otsClient.insertInstance(
+      new OTSPkg.InsertInstanceRequest({
+        clusterType: "HYBRID",
+        instanceName: otsInstanceName,
+        description: "月谕圣牌交换站数据存储"
+      })
+    );
+    console.log(`（已创建实例 ${otsInstanceName}）`);
+    // 实例创建是异步的，轮询直到可访问。
+    let ready = false;
+    for (let i = 0; i < 12; i++) {
+      await sleep(5000);
+      try {
+        await otsClient.getInstance(
+          new OTSPkg.GetInstanceRequest({ instanceName: otsInstanceName })
+        );
+        ready = true;
+        break;
+      } catch {
+        // 继续等。
+      }
+    }
+    if (!ready) {
+      throw new Error("Tablestore 实例创建后长时间不可访问，请稍后到控制台检查状态。");
     }
   }
-  throw new Error("Tablestore 实例创建后长时间不可访问，请稍后到控制台检查状态。");
+  await bindInstanceVpcIfReady();
+}
+
+// ─── VPC 网络（用于 FC 内网访问 OTS，内网流量不计费）─────────────────────────
+
+let vpcId = null;
+let vSwitchId = null;
+let securityGroupId = null;
+let otsVpcEndpoint = null;
+
+async function ensureVpcNetwork() {
+  const vpcClient = new VPCPkg.default({
+    accessKeyId: akId,
+    accessKeySecret: akSecret,
+    endpoint: `vpc.${region}.aliyuncs.com`,
+    regionId: region
+  });
+  const ecsClient = new ECSPkg.default({
+    accessKeyId: akId,
+    accessKeySecret: akSecret,
+    endpoint: `ecs.${region}.aliyuncs.com`,
+    regionId: region
+  });
+
+  const vpcName = `${prefix}-vpc`;
+  const vswitchName = `${prefix}-vswitch`;
+  const sgName = `${prefix}-sg`;
+
+  let foundVpc = null;
+  try {
+    const res = await vpcClient.describeVpcs(
+      new VPCPkg.DescribeVpcsRequest({
+        regionId: region,
+        vpcName: vpcName,
+        pageSize: 20
+      })
+    );
+    const list = res?.body?.vnpcs?.vpc ?? [];
+    foundVpc = list.find((v) => v.vpcName === vpcName) ?? null;
+  } catch (error) {
+    throw new Error(`查询 VPC 失败：${describeError(error)}`);
+  }
+  if (foundVpc) {
+    vpcId = foundVpc.vpcId;
+    console.log(`（复用已有 VPC ${vpcId}）`);
+  } else {
+    const res = await vpcClient.createVpc(
+      new VPCPkg.CreateVpcRequest({
+        regionId: region,
+        vpcName: vpcName,
+        cidrBlock: "192.168.0.0/16",
+        description: "月谕圣牌交换站（FC 内网访问 Tablestore）"
+      })
+    );
+    vpcId = res?.body?.vpcId;
+    console.log(`（已创建 VPC ${vpcId}）`);
+  }
+  if (!vpcId) {
+    throw new Error("VPC 创建结果缺少 vpcId。");
+  }
+
+  let foundSwitch = null;
+  try {
+    const res = await vpcClient.describeVSwitches(
+      new VPCPkg.DescribeVSwitchesRequest({
+        regionId: region,
+        vpcId: vpcId,
+        vSwitchName: vswitchName,
+        pageSize: 20
+      })
+    );
+    const list = res?.body?.vSwitches?.vSwitch ?? [];
+    foundSwitch = list.find((s) => s.vSwitchName === vswitchName) ?? null;
+  } catch (error) {
+    throw new Error(`查询交换机失败：${describeError(error)}`);
+  }
+  if (foundSwitch) {
+    vSwitchId = foundSwitch.vSwitchId;
+    console.log(`（复用已有交换机 ${vSwitchId}）`);
+  } else {
+    // 找一个可用区创建交换机；没有地域偏好，取第一个可创建的。
+    let zoneId = process.env.FC_ZONE_ID || "";
+    if (!zoneId) {
+      const zones = await vpcClient.describeZones(
+        new VPCPkg.DescribeZonesRequest({ regionId: region })
+      );
+      const candidates = zones?.body?.zones?.zone ?? [];
+      zoneId = candidates[0]?.zoneId;
+    }
+    if (!zoneId) {
+      throw new Error("无法获取可用区列表，请设置 FC_ZONE_ID 后重试。");
+    }
+    const res = await vpcClient.createVSwitch(
+      new VPCPkg.CreateVSwitchRequest({
+        regionId: region,
+        zoneId: zoneId,
+        vpcId: vpcId,
+        vSwitchName: vswitchName,
+        cidrBlock: "192.168.0.0/24",
+        description: "月谕圣牌交换站 FC 网段"
+      })
+    );
+    vSwitchId = res?.body?.vSwitchId;
+    console.log(`（已创建交换机 ${vSwitchId}（${zoneId}））`);
+    // 交换机创建是异步的，等它可用。
+    for (let i = 0; i < 6; i++) {
+      await sleep(3000);
+      try {
+        const attr = await vpcClient.describeVSwitchAttributes(
+          new VPCPkg.DescribeVSwitchAttributesRequest({ regionId: region, vSwitchId })
+        );
+        if (attr?.body?.vSwitchId === vSwitchId) {
+          break;
+        }
+      } catch {
+        // 继续等。
+      }
+    }
+  }
+  if (!vSwitchId) {
+    throw new Error("交换机创建结果缺少 vSwitchId。");
+  }
+
+  let foundSg = null;
+  try {
+    const res = await ecsClient.describeSecurityGroups(
+      new ECSPkg.DescribeSecurityGroupsRequest({
+        regionId: region,
+        vpcId: vpcId,
+        securityGroupName: sgName,
+        pageSize: 20
+      })
+    );
+    const list = res?.body?.securityGroups?.securityGroup ?? [];
+    foundSg = list.find((g) => g.securityGroupName === sgName) ?? null;
+  } catch (error) {
+    throw new Error(`查询安全组失败：${describeError(error)}`);
+  }
+  if (foundSg) {
+    securityGroupId = foundSg.securityGroupId;
+    console.log(`（复用已有安全组 ${securityGroupId}）`);
+  } else {
+    const res = await ecsClient.createSecurityGroup(
+      new ECSPkg.CreateSecurityGroupRequest({
+        regionId: region,
+        vpcId: vpcId,
+        securityGroupName: sgName,
+        securityGroupType: "normal",
+        description: "月谕圣牌交换站 FC 内网访问"
+      })
+    );
+    securityGroupId = res?.body?.securityGroupId;
+    console.log(`（已创建安全组 ${securityGroupId}）`);
+  }
+  if (!securityGroupId) {
+    throw new Error("安全组创建结果缺少 securityGroupId。");
+  }
 }
 
 // ─── Tablestore 建表 ──────────────────────────────────────────────────────────
@@ -199,6 +387,63 @@ const TABLES = [
   { name: "profiles", primaryKeys: [{ name: "uid", type: TableStore.PrimaryKeyType.STRING }] },
   { name: "rate_limits", primaryKeys: [{ name: "key", type: TableStore.PrimaryKeyType.STRING }] }
 ];
+
+// ─── OTS 实例绑定 VPC（绑定后才能走内网 endpoint，内网流量不计费）────────────
+
+async function bindInstanceVpcIfReady() {
+  if (!vpcId) {
+    // 独立跑 createTables 时还没有 VPC 信息，绑定交给部署主流程。
+    return;
+  }
+  let bound = false;
+  try {
+    const res = await otsClient.listVpcInfoByInstance(
+      new OTSPkg.ListVpcInfoByInstanceRequest({ instanceName: otsInstanceName })
+    );
+    const infos = res?.body?.vpcInfos?.vpcInfo ?? [];
+    bound = infos.length > 0;
+  } catch {
+    // 查询失败当作未绑定，走绑定流程。
+  }
+  if (bound) {
+    console.log("（OTS 实例已绑定 VPC，跳过）");
+    return;
+  }
+  const bindRequest = new OTSPkg.BindInstance2VpcRequest({
+    instanceName: otsInstanceName,
+    vpcId: vpcId,
+    virtualSwitchId: vSwitchId,
+    instanceVpcName: `${otsInstanceName}-vpc`,
+    regionNo: region
+  });
+  try {
+    await otsClient.bindInstance2Vpc(bindRequest);
+    console.log("（已绑定 OTS 实例到 VPC）");
+  } catch (error) {
+    const msg = String(error?.message ?? "").toLowerCase();
+    if (msg.includes("already") || msg.includes("exist")) {
+      console.log("（OTS 实例已绑定 VPC，跳过）");
+    } else {
+      throw error;
+    }
+  }
+  // 绑定后查询专用 endpoint（以服务端返回为准，不手工拼域名）。
+  try {
+    const res = await otsClient.listVpcInfoByInstance(
+      new OTSPkg.ListVpcInfoByInstanceRequest({ instanceName: otsInstanceName })
+    );
+    const infos = res?.body?.vpcInfos?.vpcInfo ?? [];
+    const found = infos.find((info) => info.vpcId === vpcId) ?? infos[0];
+    if (found?.endpoint) {
+      otsVpcEndpoint = String(found.endpoint).startsWith("http")
+        ? String(found.endpoint)
+        : `https://${String(found.endpoint).replace(/^\/+/, "")}`;
+      console.log(`（OTS 内网 endpoint：${otsVpcEndpoint}）`);
+    }
+  } catch (error) {
+    console.log(`（查询 OTS 内网 endpoint 失败，将使用默认域名：${describeError(error)}）`);
+  }
+}
 
 function callTs(fn) {
   return new Promise((resolve, reject) => {
@@ -320,8 +565,9 @@ function fcEnv() {
   if (toyOrigin) {
     origins.push(toyOrigin);
   }
+  // OTS 绑定 VPC 后使用内网 endpoint，内网流量不计费。
   return {
-    OTS_ENDPOINT: `https://${otsInstanceName}.${region}.ots.aliyuncs.com`,
+    OTS_ENDPOINT: otsVpcEndpoint ?? `https://${otsInstanceName}.${region}.vpc.tablestore.aliyuncs.com`,
     OTS_INSTANCE: otsInstanceName,
     OTS_ACCESS_KEY_ID: akId,
     OTS_ACCESS_KEY_SECRET: akSecret,
@@ -339,7 +585,7 @@ async function deployHttpFunction() {
     description: "HTTP 接口",
     runtime: "nodejs20",
     handler: "index.fcHandler",
-    memorySize: 512,
+    memorySize: 256,
     timeout: 60,
     code: { zipFile },
     environmentVariables: env
@@ -365,7 +611,7 @@ async function deployTimerFunction() {
     description: "每日定时清理",
     runtime: "nodejs20",
     handler: "fc-timer.fcTimerHandler",
-    memorySize: 512,
+    memorySize: 256,
     timeout: 300,
     code: { zipFile },
     environmentVariables: env
@@ -472,8 +718,10 @@ async function main() {
 
   await step("开通 Tablestore 服务", ensureOtsService);
   await step("创建 Tablestore 实例", ensureOtsInstance);
-  await step("创建数据表", createTables);
   await step("获取阿里云账号 ID", initFc);
+  await step("准备 VPC 网络", ensureVpcNetwork);
+  await step("创建数据表", createTables);
+  await step("绑定 Tablestore 到 VPC", bindInstanceVpcIfReady);
   await step("创建 FC 服务", ensureFcService);
   await step("打包 FC 代码", buildFc);
   await step("复制 tablestore 依赖", copyDeps);
