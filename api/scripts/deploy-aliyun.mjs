@@ -57,6 +57,13 @@ const otsClient = new OTSPkg.default({
   regionId: region
 });
 
+const vpcClient = new VPCPkg.default({
+  accessKeyId: akId,
+  accessKeySecret: akSecret,
+  endpoint: `vpc.${region}.aliyuncs.com`,
+  regionId: region
+});
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function describeError(error) {
@@ -227,13 +234,32 @@ let vSwitchId = null;
 let securityGroupId = null;
 let otsVpcEndpoint = null;
 
+async function listVpcs() {
+  const res = await vpcClient.describeVpcs(
+    new VPCPkg.DescribeVpcsRequest({ regionId: region, pageSize: 50 })
+  );
+  // 不同 SDK 版本的返回结构可能是 vpcs.vpc 或 vnpcs.vpc，两个都兜住。
+  return res?.body?.vpcs?.vpc ?? res?.body?.vnpcs?.vpc ?? [];
+}
+
+async function waitForVpcAvailable() {
+  // VPC 创建是异步的，未就绪时建交换机会报 IncorrectVpcStatus。
+  for (let i = 0; i < 20; i++) {
+    try {
+      const list = await listVpcs();
+      const found = list.find((v) => v.vpcId === vpcId);
+      if (found?.status === "Available") {
+        return;
+      }
+    } catch {
+      // 查询失败继续等。
+    }
+    await sleep(3000);
+  }
+  throw new Error("VPC 长时间未进入 Available 状态，请稍后重试。");
+}
+
 async function ensureVpcNetwork() {
-  const vpcClient = new VPCPkg.default({
-    accessKeyId: akId,
-    accessKeySecret: akSecret,
-    endpoint: `vpc.${region}.aliyuncs.com`,
-    regionId: region
-  });
   const ecsClient = new ECSPkg.default({
     accessKeyId: akId,
     accessKeySecret: akSecret,
@@ -247,15 +273,12 @@ async function ensureVpcNetwork() {
 
   let foundVpc = null;
   try {
-    const res = await vpcClient.describeVpcs(
-      new VPCPkg.DescribeVpcsRequest({
-        regionId: region,
-        vpcName: vpcName,
-        pageSize: 20
-      })
-    );
-    const list = res?.body?.vnpcs?.vpc ?? [];
-    foundVpc = list.find((v) => v.vpcName === vpcName) ?? null;
+    const list = await listVpcs();
+    // 同名 VPC 可能不止一个（历史遗留），取最早创建的那个复用。
+    const candidates = list
+      .filter((v) => v.vpcName === vpcName)
+      .sort((a, b) => String(a.creationTime ?? "").localeCompare(String(b.creationTime ?? "")));
+    foundVpc = candidates[0] ?? null;
   } catch (error) {
     throw new Error(`查询 VPC 失败：${describeError(error)}`);
   }
@@ -277,6 +300,7 @@ async function ensureVpcNetwork() {
   if (!vpcId) {
     throw new Error("VPC 创建结果缺少 vpcId。");
   }
+  await waitForVpcAvailable();
 
   let foundSwitch = null;
   try {
@@ -413,7 +437,8 @@ async function bindInstanceVpcIfReady() {
     instanceName: otsInstanceName,
     vpcId: vpcId,
     virtualSwitchId: vSwitchId,
-    instanceVpcName: `${otsInstanceName}-vpc`,
+    // InstanceVpcName 只允许小写字母和数字，不能带连字符。
+    instanceVpcName: `${otsInstanceName.replace(/-/g, "")}vpc`,
     regionNo: region
   });
   try {
